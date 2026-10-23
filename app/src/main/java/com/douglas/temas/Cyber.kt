@@ -76,9 +76,10 @@ object Cyber {
             val bc = android.provider.Settings.Global.getInt(ctx.contentResolver, "boot_count", -1)
             val bootAt = System.currentTimeMillis() - SystemClock.elapsedRealtime()
             val isNew = if (bc >= 0) bc != p.getInt("intro_bc", -2) else Math.abs(bootAt - p.getLong("intro_bt", 0L)) > 120000L
-            // solo si la radio acaba de encender (no al abrir la app horas después)
-            if (isNew && SystemClock.elapsedRealtime() < 10 * 60 * 1000L) {
-                p.edit().putInt("intro_bc", bc).putLong("intro_bt", bootAt).apply()
+            val nowMs = System.currentTimeMillis()
+            val stale = nowMs - p.getLong("intro_last", 0L) > 30 * 60 * 1000L
+            if (isNew || stale) {
+                p.edit().putInt("intro_bc", bc).putLong("intro_bt", bootAt).putLong("intro_last", nowMs).apply()
                 introT0 = now
             }
         }
