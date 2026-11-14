@@ -108,8 +108,15 @@ class CyberpunkTheme : LauncherTheme {
 
     private fun isInstalled(ctx: Context, pkg: String): Boolean = try { ctx.packageManager.getApplicationInfo(pkg, 0); true } catch (e: Exception) { false }
 
-    /** Clima de Managua desde Open-Meteo (sin clave). Si no hay internet se queda en "--°C". */
-    private fun fetchWeather(root: View, temp: TextView) {
+    /**
+     * Temperatura: internet (Open-Meteo, Managua) -> si no hay internet, sensor del equipo -> último dato guardado ("~28°C") -> "--°C".
+     */
+    private fun fetchWeather(root: View, temp: TextView, host: ThemeHost) {
+        val prefs = root.context.getSharedPreferences("launcher", Context.MODE_PRIVATE)
+        if (!temp.text.toString().any { it.isDigit() }) {   // al abrir, muestra enseguida el último dato guardado
+            val last = prefs.getInt("last_temp", Int.MIN_VALUE)
+            if (last != Int.MIN_VALUE) temp.text = "~$last°C"
+        }
         Thread {
             var ok = false
             try {
@@ -118,10 +125,20 @@ class CyberpunkTheme : LauncherTheme {
                 c.connectTimeout = 8000; c.readTimeout = 8000
                 val txt = c.inputStream.bufferedReader().use { it.readText() }
                 val t = Math.round(org.json.JSONObject(txt).getJSONObject("current").getDouble("temperature_2m")).toInt()
+                prefs.edit().putInt("last_temp", t).apply()
                 root.post { temp.text = "$t°C" }
                 ok = true
             } catch (e: Exception) { }
-            root.postDelayed({ if (root.isAttachedToWindow) fetchWeather(root, temp) }, if (ok) 15 * 60 * 1000L else 2 * 60 * 1000L)
+            if (!ok) root.post {
+                val s = host.ambientTempC()
+                val last = prefs.getInt("last_temp", Int.MIN_VALUE)
+                temp.text = when {
+                    s != null -> "${Math.round(s)}°C"
+                    last != Int.MIN_VALUE -> "~$last°C"
+                    else -> "--°C"
+                }
+            }
+            root.postDelayed({ if (root.isAttachedToWindow) fetchWeather(root, temp, host) }, if (ok) 15 * 60 * 1000L else 2 * 60 * 1000L)
         }.start()
     }
 
@@ -274,6 +291,8 @@ class CyberpunkTheme : LauncherTheme {
 
         val roadBox = FrameLayout(ctx).apply { background = CutDrawable(pal, 1.8f * cq, bd) }
         val road = CyberRoadView(ctx, pal)
+        road.speedProvider = { host.speedKmh() }
+        road.headingProvider = { host.headingDeg() }
         val ins = Math.ceil(bd.toDouble()).toInt()
         roadBox.addView(road, FrameLayout.LayoutParams(-1, -1).apply { setMargins(ins, ins, ins, ins) })
         // intro de arranque (solo al encender la radio); después queda el ciclo de la camioneta
@@ -314,8 +333,25 @@ class CyberpunkTheme : LauncherTheme {
             background = GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT, intArrayOf(Cyber.alpha(pal.neon, .6f), Cyber.alpha(pal.neon, 0f)))
         }, LP(0, max(2, (2f * ctx.resources.displayMetrics.density).toInt()), 1f).apply { setMargins(q(2f), 0, q(2f), 0) })
         val temp = Cyber.textPx(ctx, "--°C", 2.2f * cq, pal.amber, true, 1f * cq, Cyber.alpha(pal.amber, .6f)).apply { gravity = Gravity.CENTER }
+        // voltaje del carro (solo aparece si la radio lo entrega): rojo < 11.8 V, ámbar > 14.8 V (alternador cargando)
+        val volt = Cyber.textPx(ctx, "", 1.5f * cq, pal.text, true).apply { gravity = Gravity.CENTER; visibility = View.GONE }
+        bar.addView(volt, LP(-2, -2).apply { rightMargin = q(2f) })
+        val voltTick = object : Runnable {
+            override fun run() {
+                if (!root.isAttachedToWindow) return
+                val v = host.voltageV()
+                if (v == null) volt.visibility = View.GONE
+                else {
+                    volt.visibility = View.VISIBLE
+                    volt.text = String.format("%.1f V", v)
+                    volt.setTextColor(if (v < 11.8f) pal.hot else if (v > 14.8f) pal.amber else pal.text)
+                }
+                root.postDelayed(this, 2000)
+            }
+        }
+        root.post(voltTick)
         bar.addView(temp, LP(-2, -2).apply { rightMargin = q(2f) })
-        fetchWeather(root, temp)
+        fetchWeather(root, temp, host)
 
         val clockBox = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.END }
         fun clock(fmt: String, px: Float, color: Int, bold: Boolean) = TextClock(ctx).apply {
@@ -566,6 +602,12 @@ class CyberRoadView(ctx: Context, private val pal: Cyber.Pal) : View(ctx) {
     private var pf = 0f; private var pr = 0f; private var ang = 0f
     private var nextGlitch = 1500f; private var glitchUntil = 0f; private var gA = 0f; private var gB = 0f; private var gDx = 0f
     private var lastV = 0
+    /** Si se asigna, el HUD muestra la velocidad real (km/h) o "--" sin señal; si no, una velocidad de demostración. */
+    var speedProvider: (() -> Float?)? = null
+    /** Rumbo en grados (0 = norte) o null. Solo se usa si hay speedProvider (GPS real). */
+    var headingProvider: (() -> Float?)? = null
+    private fun cardinal(d: Float): String =
+        arrayOf("N", "NE", "E", "SE", "S", "SO", "O", "NO")[(Math.round(d / 45f) % 8)]
 
     // chispas
     private val px = FloatArray(80); private val py = FloatArray(80); private val pvx = FloatArray(80)
@@ -877,16 +919,20 @@ class CyberRoadView(ctx: Context, private val pal: Cyber.Pal) : View(ctx) {
 
         // ---- HUD: velocidad y suspensión (medidas del diseño, en cq) ----
         hudBig.textSize = 2.6f * cq; hudSmall.textSize = 1.15f * cq
-        val v = Math.round(42f + 4f * sin(el / 900f))
-        if (v != lastV) lastV = v
+        val sp = speedProvider
+        val vTxt = if (sp == null) Math.round(42f + 4f * sin(el / 900f)).toString() else (sp()?.let { Math.round(it).toString() } ?: "--")
         hudBig.setShadowLayer(1f * cq, 0f, 0f, Cyber.alpha(pal.amber, .6f))
         fun base(p: Paint, top: Float, lh: Float): Float { val fm = p.fontMetrics; return top + (lh - (fm.descent - fm.ascent)) / 2f - fm.ascent }
         val top0 = h * .05f
         val l1 = 2.6f * cq * 1.5f
         hudBig.textAlign = Paint.Align.LEFT
-        c.drawText("$lastV km/h", w * .04f, base(hudBig, top0, l1), hudBig)
+        c.drawText("$vTxt km/h", w * .04f, base(hudBig, top0, l1), hudBig)
         hudSmall.textAlign = Paint.Align.LEFT
-        c.drawText("Velocidad", w * .04f, base(hudSmall, top0 + l1, 1.15f * cq * 1.5f), hudSmall)
+        val vLabel = if (speedProvider == null) "Velocidad" else {
+            val hd = headingProvider?.invoke()
+            "Velocidad · " + (if (hd == null) "--" else cardinal(hd) + " " + String.format("%03d", Math.round(hd) % 360) + "°")
+        }
+        c.drawText(vLabel, w * .04f, base(hudSmall, top0 + l1, 1.15f * cq * 1.5f), hudSmall)
         val bw = 11f * cq; val bx = w * .96f - bw
         val l2 = 1.15f * cq * 1.2f
         hudSmall.textAlign = Paint.Align.RIGHT
