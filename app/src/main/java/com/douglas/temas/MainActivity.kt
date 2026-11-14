@@ -1,6 +1,16 @@
 package com.douglas.temas
 
+import android.Manifest
+import android.content.IntentFilter
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.app.Activity
+import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
+import android.os.SystemClock
 import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
@@ -81,7 +91,80 @@ class MainActivity : Activity(), ThemeHost {
         })
     }
 
-    override fun onResume() { super.onResume(); hideBars(); checkHome() }
+    override fun onResume() { super.onResume(); hideBars(); checkHome(); startGps(); startSensors() }
+    override fun onPause() { stopGps(); stopSensors(); super.onPause() }
+
+    // ---- Velocidad real por GPS ----
+    private val REQ_GPS = 78
+    private var gpsAsked = false
+    private var lm: LocationManager? = null
+    @Volatile private var gpsKmh = -1f
+    @Volatile private var gpsAt = 0L
+    @Volatile private var brg = -1f
+    @Volatile private var ambient = Float.NaN
+    private var sm: SensorManager? = null
+    private val locL = object : LocationListener {
+        override fun onLocationChanged(l: Location) {
+            gpsKmh = if (l.hasSpeed()) l.speed * 3.6f else -1f
+            gpsAt = SystemClock.elapsedRealtime()
+            // el rumbo del GPS solo es confiable en movimiento (>= 3 km/h); parado se conserva el último
+            if (l.hasBearing() && l.hasSpeed() && l.speed * 3.6f >= 3f) brg = l.bearing
+        }
+        override fun onStatusChanged(p: String?, s: Int, e: Bundle?) {}
+        override fun onProviderEnabled(p: String) {}
+        override fun onProviderDisabled(p: String) {}
+    }
+
+    /** km/h reales; null si no hay fix reciente (más de 4 s). Por debajo de 2 km/h se muestra 0 (ruido del GPS parado). */
+    override fun speedKmh(): Float? {
+        if (gpsKmh < 0f || SystemClock.elapsedRealtime() - gpsAt > 4000L) return null
+        return if (gpsKmh < 2f) 0f else gpsKmh
+    }
+
+    override fun headingDeg(): Float? = if (speedKmh() == null || brg < 0f) null else brg
+
+    /** Voltaje del carro: solo se muestra si el equipo reporta una batería que parezca de carro (9 V o más). Un celular/tablet (~4 V) se ignora. */
+    override fun voltageV(): Float? = try {
+        val i = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        val mv = i?.getIntExtra("voltage", 0) ?: 0
+        val v = if (mv > 1000) mv / 1000f else mv.toFloat()
+        if (v >= 9f && v <= 20f) v else null
+    } catch (e: Exception) { null }
+
+    override fun ambientTempC(): Float? = if (ambient.isNaN()) null else ambient
+
+    private val sensL = object : SensorEventListener {
+        override fun onSensorChanged(e: SensorEvent) { if (e.values.isNotEmpty()) ambient = e.values[0] }
+        override fun onAccuracyChanged(s: Sensor?, a: Int) {}
+    }
+    private fun startSensors() {
+        try {
+            val m = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+            sm = m
+            m.getDefaultSensor(Sensor.TYPE_AMBIENT_TEMPERATURE)?.let { m.registerListener(sensL, it, SensorManager.SENSOR_DELAY_NORMAL) }
+        } catch (e: Exception) { }
+    }
+    private fun stopSensors() { try { sm?.unregisterListener(sensL) } catch (e: Exception) { } }
+
+    private fun startGps() {
+        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            if (!gpsAsked) { gpsAsked = true; requestPermissions(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION), REQ_GPS) }
+            return
+        }
+        try {
+            val m = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+            lm = m
+            m.removeUpdates(locL)
+            m.requestLocationUpdates(LocationManager.GPS_PROVIDER, 1000L, 0f, locL)
+        } catch (e: Exception) { }
+    }
+
+    private fun stopGps() { try { lm?.removeUpdates(locL) } catch (e: Exception) { } }
+
+    override fun onRequestPermissionsResult(req: Int, perms: Array<out String>, res: IntArray) {
+        super.onRequestPermissionsResult(req, perms, res)
+        if (req == REQ_GPS && res.isNotEmpty() && res[0] == PackageManager.PERMISSION_GRANTED) startGps()
+    }
 
     /** Si no somos el home por defecto, muestra un aviso para elegirnos como pantalla de inicio. */
     private fun checkHome() {
