@@ -33,6 +33,10 @@ interface ThemeHost {
     fun nowPlaying(): NowPlaying?   // null = falta permiso de acceso a notificaciones
     fun requestMediaAccess()
     fun openSettings(action: String)
+    fun speedKmh(): Float? = null   // velocidad real por GPS en km/h; null = sin señal de GPS
+    fun headingDeg(): Float? = null // rumbo por GPS (0-359, 0 = norte); null = sin señal o sin movimiento todavía
+    fun voltageV(): Float? = null   // voltaje del carro si la radio lo entrega; null = no disponible
+    fun ambientTempC(): Float? = null // sensor de temperatura del equipo, si tiene
     fun rebuildTheme()             // vuelve a construir el tema actual (por ejemplo al cambiar el color del HUD)
 }
 
